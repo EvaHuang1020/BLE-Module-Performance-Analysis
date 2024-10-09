@@ -1,0 +1,348 @@
+//===== BLE Mini-Delay－CBR with frame padding Rx-Side V1.0 ===== 24.05.16
+//===== For Prof.FZ Chen's LAB: PowerElectronics LAB, Receiver/LOG <<<---
+//===== Serial Bluetooth Terminal V1.28(APP): Frame time (Receive/ Newline: None)
+//===== Board: MSP-EXP430G2ET, J-RXD:RXD(top)-P1.2, J-TXD:P1.1(top)-TXD
+//===== BLE NIC version: BT05v5.6
+//===== H/W UART:RXD/P1.1, TXD/P1.2, slave traffic to APP, 16M DCO:MCLK, 8M:SMCLK
+//===== S/W UART(115200@8M:SMCLK) on Timer1 (TXD:P2.0, RXD:P2.2)
+//===== Timer0(TA):LOG TAR, P2.3(ext.INT from Sender) trigger START_time record
+//===== P1.3(ext.INT) trigger output LOG on UART1
+//===== Data flow format: a0 ~ aF, padding bit:'*'(skip)
+//===== CBR : TA0 for interval control; 115200:20 bytes < 2ms
+//===== V1.0 code by J.R. Lai, NKUST EE, Taiwan, 2024.05.16
+//***** Bus Stop model; Full(20) to go, Time(30ms) to go
+//*****
+// BLE SERIAL APP: FrameTime: SETTINGS >> RECEIVE >> Newline(CR+LF):None <<<---
+// HW_UART: TXD/P1.2, RXD/P1.1; EVM J101: FET:G-5-3-Tx-P1.1-D;Target:P1.2-Rx(USB)
+//          115200: 20 bytes < 2ms;  ?? BLE BW and Delay (frame)
+// TA1:SW_UART_1:TX/P2.0, RX/P2.2; BLE:RX-USB_TX (CCS + AT /r:CR:0x0D + /n:LF:0x0A,TXT)
+// P2.3 START_TX time recording:ext INT
+// RefLib: ltoa( pyld2[l]:16 bytes, bufffer, radix );
+// ++
+// Final : Z_BLE_UTL_CBR_V2_1.txt                           <<<<<<<<----------
+// Workspace\24_JAN_LAB_工作\24May_BLE_DelayExp\Exp_Code
+//===================================================================================
+#include <msp430.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+                        //----- 16M DCO version for MCLK, SMCLK: 4M ------------
+//#define UCA0_9600               //Define the UCA0 BAUD rate, Option A:UCA0_9600
+#define UCA0_115200  //Options:{UCA0_57600, UCA0_115200}
+
+#define BLE4_FRAME_SIZE     (20)
+
+#define UART1_TBIT          (8000000 / 115200)        //115200, 8M:
+#define UART1_TBIT_DIV_2    (8000000 / (115200 * 2))  //half of the PWM width
+
+void Initialize();
+void UCA0_UART_8M_init(void);       //8M, SMCLK:8M
+void TA1_UART_init(void);        //8M, SMCLK:16M/2
+
+void UCA0_TxString(char *string);           //Hardware UART
+void UCA0_TxByte(char txByte);
+void TimerA_UART1_tx(unsigned char txByte);   //Software UART on Timer1
+void TimerA_UART1_print(unsigned char *string);
+
+
+const char KUAS_EE[]="E.E. Dept., National Kaohsiung University of Science and Technology(NKUST),\
+Taiwan 2024 May\r\n";
+const char table_Dec2Hex[] = "0123456789ABCDEFG";       //table for Hex transformation
+
+unsigned int tx0_Data,tx1_Data;             // SW UART GOLBAL variable for TX_ISR(), TimerA
+unsigned char rx0_Buffer,rx1_Buffer;        // SW UART Received UART character
+
+unsigned short recTimeRxByte[45] = {0};      //TAR, byteRx time, record <<<<---------
+unsigned short recTime_StartTx = 0;
+unsigned char recRxByte[45] = {0};           //record RxByte, content   <<<<---------
+char tmpBuf[6] = {0};                       //buffer for ltoa()
+char cnt_Record = 0;
+short cnt_RxByte = 0;
+
+
+int main(void){
+    unsigned char cnt_i;
+    unsigned short *ptr_recTime;
+    WDTCTL = WDTPW + WDTHOLD;
+    Initialize();                       //GIE enable
+
+    TimerA_UART1_print( KUAS_EE );
+    TimerA_UART1_print(" [1] G2xx2 TimerA UART_1\r\n");
+    //TimerA_UART1_print("READY! [S]lave Console.\r\n");
+
+    //--- TA0 TIMER, one tick = 1 us, MAX: 65 ms
+    TA0CTL = TASSEL_2 + ID_3 + MC_2 + TACLR;  //1M, SMCLK:8M/8, continuous mode(10)
+
+
+    for (;;){
+    //---------------------(1)  --------
+        TimerA_UART1_print("\r\n Press P1.3 Trigger BLE Listening.");
+        P1OUT |= BIT0;           P1OUT &= ~BIT6;        //LED indicator, state:waiting
+        // Wait for P1.3 to trigger NEXT event
+        P1IES |=  BIT3;     P1IFG &= ~(BIT3);       P1IE  |=  BIT3;
+        __bis_SR_register( LPM0_bits + GIE );
+
+        //P1OUT &= ~BIT0;
+        P1OUT |= BIT6;        //P1.6 show state: Listen
+        TimerA_UART1_print("\r\n BLE Listening! P1.3 Trigger STOP!");
+
+        IE2 |= UCA0RXIE; // Enable USCI_A0 RX interrupt
+
+        P1IES |=  BIT3;     P1IFG &= ~(BIT3);       P1IE  |=  BIT3;
+        __bis_SR_register( LPM0_bits + GIE );
+        P1OUT &= ~BIT6;        //LED indicator, state:waiting
+        IE2 &= ~(UCA0RXIE);     // disable USCI_A0 RX interrupt
+
+        TimerA_UART1_print("\r\n Now, Stop and See Report!");
+        TimerA_UART1_print("\r\n Rx Data = \r\n");
+        TimerA_UART1_print( recRxByte );
+        TimerA_UART1_print("\r\n Time: Start TX = ");
+        ltoa( recTime_StartTx, tmpBuf, 10 );                //LIB, not suggested, (num, buf, radix)
+        TimerA_UART1_print( (unsigned char*)tmpBuf );
+
+        TimerA_UART1_print("\r\n Time: 1st Rx Byte= ");
+        ltoa( *recTimeRxByte, tmpBuf, 10 );                //LIB, not suggested, (num, buf, radix)
+        TimerA_UART1_print( (unsigned char*)tmpBuf );
+
+        cnt_i = 2;
+        ptr_recTime = recTimeRxByte;
+        while( cnt_i-- ){
+            TimerA_UART1_print("\r\n Time: Rx Byte= ");
+            ltoa( *ptr_recTime++, tmpBuf, 10 );                //LIB, not suggested, (num, buf, radix)
+            TimerA_UART1_print( (unsigned char*)tmpBuf );
+            TimerA_UART1_print("\t");
+            ltoa( *ptr_recTime++, tmpBuf, 10 );                //LIB, not suggested, (num, buf, radix)
+            TimerA_UART1_print( (unsigned char*)tmpBuf );
+            TimerA_UART1_print("\t");
+            ltoa( *ptr_recTime++, tmpBuf, 10 );                //LIB, not suggested, (num, buf, radix)
+            TimerA_UART1_print( (unsigned char*)tmpBuf );
+            TimerA_UART1_print("\t");
+            ltoa( *ptr_recTime++, tmpBuf, 10 );                //LIB, not suggested, (num, buf, radix)
+            TimerA_UART1_print( (unsigned char*)tmpBuf );
+            TimerA_UART1_print("\t");
+          }//end of while-cnt_i
+
+        __delay_cycles(100000);    //delay for UART_FINISH
+        __no_operation();          //debug, See statistics HERE!! <<<------------------
+
+        //---clear data
+        cnt_Record = 45;
+        while( cnt_Record-- ){
+            recTimeRxByte[cnt_Record] = 0;
+            recRxByte[cnt_Record] =  0;
+          }//end of while-cnt_Record
+
+        recTime_StartTx = 0;
+        cnt_Record = 0;
+        TimerA_UART1_print("\r\n Rx LOG clear!\r\n");
+    }// end of for-1
+    return 0;
+} //end of main()
+
+void Initialize(){
+    //Basic Clock System Setup: 16M DCO, MCLK:16M, SMCLK:8M
+    if (CALBC1_16MHZ == 0xFF)
+        while(1);
+    DCOCTL = 0;
+    BCSCTL1 = CALBC1_16MHZ;      DCOCTL = CALDCO_16MHZ;
+    BCSCTL1 &= ~(DIVA_3);       BCSCTL1 |= (XT2OFF + DIVA_0);   //ACLK/1
+    BCSCTL2 |= DIVS_1;           //SMCLK = 16/2=8 M
+    BCSCTL3 = LFXT1S_2;         //VLO -> ACLK
+
+    //OUTPUT:LED Setup Port 1, 2 , general purpose
+    P1DIR = 0xFF;           P1OUT = 0x00;
+    P2DIR = 0xFF;           P2OUT = 0x00;
+
+    //External Interrupt: P1.3 for Traffic Tx, P1.4: Reset Rx Report/Switch Timer
+    P1DIR &= ~(BIT3);   P1REN |= BIT3;          P1OUT |=  BIT3;
+    P1IES |=  BIT3;     P1IFG &= ~(BIT3);       P1IE  |=  BIT3;
+
+    //External Interrupt: P2.3 for recTime_START from source
+     P2DIR &= ~(BIT3);   P2REN |= BIT3;          P2OUT |=  BIT3;
+     P2IES |=  BIT3;     P2IFG &= ~(BIT3);       P2IE  |=  BIT3;
+
+    // UART: SW + HW
+    TA1_UART_init();
+    UCA0_UART_8M_init();
+
+    __bis_SR_register(GIE);      //enable GIE
+}// End of Init()
+
+void TA1_UART_init(void){
+     // == Timer_1, SW_UART_1: TXD on P2.0 (TA1.0, OUT), RXD on P2.2 (Timer1_A.CCI1B input)
+    P2DIR &= ~(BIT2);           P2SEL |= (BIT0 + BIT2);
+    TA1CCTL0 = OUT;                         // Set TXD Idle as Mark = '1'
+    TA1CCTL1 = CCIS_1 + SCS + CM1 + CAP + CCIE;     //CCI1B, Capture, Int
+    TA1CTL = TASSEL_2 +  MC_2 + TACLR;       // SMCLK@8M, continuous mode(10),
+
+}// End of TimerA_UART_init ()
+
+void UCA0_TxString(char *string){
+    while (*string) {
+        while ( !(IFG2 & UCA0TXIFG) );  //Polling, USCI_A0 TX buffer ready?
+        UCA0TXBUF = *string++;
+    }//end of while-string
+}// End of UCA0_TxString()
+
+void UCA0_TxByte(char txByte){
+   while ( !(IFG2 & UCA0TXIFG) );  //Polling, USCI_A0 TX buffer ready?
+   UCA0TXBUF = txByte;
+
+}// End of UCA0_TxByte()
+
+void TimerA_UART1_tx(unsigned char txByte){
+    while (TA1CCTL0 & CCIE);            // wait here till last character tx(OK)
+    TA1CCR0 = TA1R;                         // Current state of TA counter
+    TA1CCR0 += UART1_TBIT;              // One bit time (timer)
+    TA1CCTL0 = OUTMOD0 + CCIE;          // Set(mode 1:SET) TXD on EQU0, Int
+
+    tx1_Data = txByte;                        // data bits (8)
+    tx1_Data |= 0x100;                  // Add mark STOP bit(1) to TXData
+    tx1_Data <<= 1;                     // Add space START bit(0), 10 bits
+}// End of TimerA_UART1_tx()
+
+void TimerA_UART1_print(unsigned char *string){
+    while (*string) {
+        TimerA_UART1_tx(*string++);
+    }
+}// End of TimerA_UART1_print()
+
+void UCA0_UART_8M_init(void){
+    // UCA0:    RXD on P1.1(UCA0RXD), TXD on P1.2(UCA0TXD)
+       P1SEL |= (BIT1 + BIT2);     P1SEL2 |= (BIT1 + BIT2);
+       // UCA0 BAUD Rate, RST, initialize
+           UCA0CTL1 |= UCSSEL_2; // SMCLK, 4M <<<---------
+
+#ifdef  UCA0_9600
+           //----------9,600 bps-----------------------------
+           UCA0BR0 = 0x41;              // 833 = 0x341, 8MHz 9600, slau144j, Table 15-4
+           UCA0BR1 = 0x03;                // 8MHz 9600
+           UCA0MCTL = UCBRS_2;          // Modulation UCBRSx
+           //--------------------------
+#endif
+
+#ifdef  UCA0_115200
+           //----------115,200 bps-----------------------------
+           UCA0BR0 = 69;              // 8MHz 115200, 80000/1152 = 69.44
+           UCA0BR1 = 0;              // 16MHz 115200
+           UCA0MCTL = UCBRS_4;       // Modulation UCBRSx = 4, 4/8 = 0.5
+           //---------------------------
+#endif
+
+#ifdef  UCA0_57600
+           //----------56,000 bps-----------------------------
+           UCA0BR0 = 138;          //80000/576=138.88
+           UCA0BR1 = 0;
+           UCA0MCTL = UCBRS_7;
+           //--------------------------
+#endif
+           UCA0CTL1 &= ~(UCSWRST);
+           //IE2 |= UCA0RXIE; // Enable USCI_A0 RX interrupt
+}// End of UCA0_UART_init ()
+
+//******************* ISR ***********************************
+#pragma vector = TIMER1_A0_VECTOR
+__interrupt void Timer1_A0_ISR(void){
+static unsigned char txBitCnt = 10;     //Start_BIT + 1 Byte + Stop_BIT
+
+    TA1CCR0 += UART1_TBIT;              // Add Offset to CCRx, timer
+    if (txBitCnt == 0) {                // TX bit count, 10 bits to TX?
+        TA1CCTL0 &= ~(CCIE);            // All bits TXed, disable interrupt
+        txBitCnt = 10;                  // Re-load bit counter
+    }
+    else {
+        if (tx1_Data & BIT0) {
+            TA1CCTL0 &= ~OUTMOD2;       //001, back to SET,:TX Mark '1'
+        }
+        else {
+            TA1CCTL0 |= OUTMOD2;        //RESET(Mode 5,101),TX Space '0'
+        }
+    tx1_Data >>= 1;
+    txBitCnt--;
+    }//end of else-txBitcnt
+
+}// End of Timer1_A0_ISR(),TA1CCR0 CCIFG only
+
+#pragma vector = TIMER1_A1_VECTOR
+__interrupt void Timer1_A1_ISR(void){
+static unsigned char rxBitCnt = 8;
+static unsigned char rxData = 0;
+
+    switch( TA1IV ) {
+        case  2:
+            TA1CCR1 += UART1_TBIT;      // Add Offset to CCRx, Next BIT detection
+            if (TA1CCTL1 & CAP) {           // Start bit captured !
+                TA1CCTL1 &= ~(CAP); // STOP capture, use TIMER detection instead
+                TA1CCR1 += UART1_TBIT_DIV_2;    // Point CCRx to middle of D0
+            }
+            else {
+                rxData >>= 1;               //default Dx = 0
+                if (TA1CCTL1 & SCCI) {      // Synchronized capture/compare input
+                rxData |= 0x80;             //Rx bit placed at BIT7
+                }
+                rxBitCnt--;
+                if (rxBitCnt == 0) {        // All bits RXed?
+                    rx1_Buffer = rxData;        // Store in global variable
+                    //-- processing RX data here
+
+                    rxBitCnt = 8;           // Re-load bit counter
+                    TA1CCTL1 |= CAP;        // One byte RX ok, Back to capture mode
+                    //__bic_SR_register_on_exit(LPM0_bits);  //**wake up to echo back
+                }
+            }//end of else-CAP
+                break;
+        case  4:                            // CCR2,unused
+        case 10:                        // TAIFG overflow,unused
+        default:
+                break;
+    }//end of switch-TA1IV
+}// End of Timer1_A1_ISR(),shared by TA0CCR1,TA0CCR2 CCIFG and TAIFG
+
+#pragma vector = USCIAB0RX_VECTOR
+__interrupt void USCI0RX_ISR(void){
+char    rxByte;
+    rxByte = UCA0RXBUF;
+    ++cnt_RxByte;
+    //skip padding mark:'*'
+    if( '*' != rxByte ){
+        if ( cnt_Record < 42 ){
+            recTimeRxByte[cnt_Record] = TA0R;
+            recRxByte[cnt_Record++] =  rxByte;
+          }//end of if-cnt_RxByte
+        else{
+            IE2 &= ~(UCA0RXIE);     // Enable USCI_A0 RX interrupt
+            IFG2 &= ~(UCA0RXIFG);    // clear FLAG
+            //TimerA_UART1_print( " Stop RX. Full! P1.3 go NEXT\r\n" ); //Info-Stop on UART1
+          }//end of else-Stop Rx, cnt_RxByte
+      }//end of if-rxByte
+
+}// End of USCI0RX_ISR()
+
+#pragma vector = PORT1_VECTOR
+__interrupt void PORT1_ISR(void){
+    __delay_cycles(160000);                 //de-bouncing 10ms
+    if ( !(P1IN & BIT3)){
+        P1IE  &= ~(BIT3);       P1IFG  &= ~(BIT3);      //disable and clear
+        __bic_SR_register_on_exit(LPM3_bits);        //always exit and wake up
+    }//end of if P1.3, de-bouncing
+    //P1IE  |= BIT3;          //Re-Enable P1 INT
+}// End of PORT1_ISR()
+
+#pragma vector = PORT2_VECTOR
+__interrupt void PORT2_ISR(void){
+     P2IE  &= ~(BIT3);       P2IFG  &= ~(BIT3);      //disable and clear
+
+     recTime_StartTx = TA0R;      //record Tx starting time
+     __no_operation();          //debug
+    //P1IE  |= BIT3;          //Re-Enable P1 INT
+}// End of PORT2_ISR()
+
+#pragma vector = WDT_VECTOR
+__interrupt void WDT_ISR(void){
+    WDTCTL = WDTPW + WDTHOLD;       //hold the WDT
+    IE1 &= ~(WDTIE);        IFG1 &= ~(WDTIFG);
+    __bic_SR_register_on_exit(LPM3_bits);        //always exit and wake up
+}// End of WDT_ISR()
+
+
+//END of PROGRAM $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
